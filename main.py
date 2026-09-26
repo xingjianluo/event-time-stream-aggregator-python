@@ -1,13 +1,10 @@
+"""Service entrypoint: exposes the aggregation app via uvicorn."""
+
 import uvicorn
-from fastapi import FastAPI
 
-app = FastAPI()
+from aggregator.api import create_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
-
+app = create_app()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=0)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
