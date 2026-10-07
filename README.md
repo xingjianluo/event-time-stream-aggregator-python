@@ -54,17 +54,67 @@ uv run python main.py   # 启动 HTTP 服务（127.0.0.1，随机端口）
   `log_capacity` 时，`poll` 抛出 `SubscriptionClosed`（明确拒绝），
   而不是让缓冲无界增长；客户端可从 `acked_seq` 重新订阅续传。
 - HTTP 入口：`POST /events`（返回逐事件判定）、`GET /watermark`、
-  `GET /results?after_seq=&limit=`（增量拉取）。
+  `GET /stats`（运行状态快照）、会话式订阅端点（见下）；
+  `GET /results?after_seq=&limit=` 保留为无状态一次性拉取（兼容旧用法）。
+
+## 有界保留与续传点过旧
+
+- 结果日志只保留最近 `retention_capacity` 条，超出后最老的按 FIFO 淘汰，
+  服务长期运行内存有界。
+- 客户端断开很久后拿旧续传点回来，若该位置之前的结果已被淘汰，
+  服务端**显式拒绝**（内存 API 抛 `ResumePointExpired`，HTTP 返回
+  `410 + reason=resume_expired`），提示客户端做全量同步，
+  绝不悄悄跳过一段、给出缺数据却看似正常的结果。
+- 两类拒绝可机器区分：
+
+  | 场景             | 内存 API              | HTTP                       | 恢复方式                     |
+  |------------------|-----------------------|----------------------------|------------------------------|
+  | 消费太慢（背压） | `SubscriptionClosed`  | `409 reason=backpressure`  | ack 已取结果或按 acked 重连  |
+  | 续传点太旧       | `ResumePointExpired`  | `410 reason=resume_expired`| 全量同步（resume_from=0）    |
+
+- 窗口一旦 `FINAL`，其聚合状态立即回收；长期运行时存活窗口数只与
+  迟到视界有关，不与运行时长有关（回收不改变任何后续判定，
+  超期事件仍按水位线得到 `too_late`）。
+
+## HTTP 会话式订阅
+
+```bash
+# 1. 建会话（新客户端 resume_from=0；重连时带上最近 ack 的序号）
+curl -X POST localhost:PORT/sessions -H 'content-type: application/json' \
+     -d '{"resume_from": 0}'
+# -> {"session_id": "...", "resume_from": 0}
+
+# 2. 拉取本会话的下一批结果（每个会话独立推进，互不影响）
+curl "localhost:PORT/sessions/<sid>/results?limit=100"
+
+# 3. 确认消费位置；只有 ack 过的位置才算真正消费掉
+curl -X POST localhost:PORT/sessions/<sid>/ack \
+     -H 'content-type: application/json' -d '{"upto_seq": 42}'
+
+# 4. 断线重连：用最近 ack 的序号建新会话，不缺失、不重复
+curl -X POST localhost:PORT/sessions -d '{"resume_from": 42}' ...
+```
+
+- 未确认积压超过 `log_capacity` 时，拉取返回 `409 reason=backpressure`；
+  ack 之后或按 acked 位置重连即可继续。
+- 会话被 LRU 淘汰或不存在时返回 `404 reason=unknown_session`，
+  按最近 ack 位置重建会话即可。
+- ack 超过已投递位置返回 `400 reason=invalid_ack`。
+- `GET /stats` 返回运行快照：`open_windows`（仍在累积的窗口数）、
+  `retained_results` / `evicted_results`（保留/已淘汰结果数）、
+  以及 `accepted`、`ignored_duplicate`、`ignored_too_late`、
+  `rejected_invalid`、`backpressure`、`resume_expired` 各类计数。
 
 ## 关键配置项（`AggregatorConfig`）
 
-| 配置               | 默认值   | 含义                                       |
-|--------------------|----------|--------------------------------------------|
-| `window_size`      | 60.0     | 滚动窗口大小（秒）                         |
-| `out_of_orderness` | 10.0     | 水位线滞后于最大事件时间的秒数             |
-| `allowed_lateness` | 30.0     | 窗口触发后仍接受修正的额外秒数             |
-| `dedup_capacity`   | 100000   | 去重存储记住的最大事件 id 数               |
-| `log_capacity`     | 10000    | 每个订阅允许的最大未确认结果数（背压阈值） |
+| 配置                  | 默认值   | 含义                                       |
+|-----------------------|----------|--------------------------------------------|
+| `window_size`         | 60.0     | 滚动窗口大小（秒）                         |
+| `out_of_orderness`    | 10.0     | 水位线滞后于最大事件时间的秒数             |
+| `allowed_lateness`    | 30.0     | 窗口触发后仍接受修正的额外秒数             |
+| `dedup_capacity`      | 100000   | 去重存储记住的最大事件 id 数               |
+| `log_capacity`        | 10000    | 每个订阅允许的最大未确认结果数（背压阈值） |
+| `retention_capacity`  | 10000    | 结果日志保留的最大条数（超出淘汰最老）     |
 
 ## 验证方法
 
@@ -80,7 +130,29 @@ uv run pytest -q -s             # 打印输入事件、水位线与判定依据�
 - `tests/test_idempotency.py`：重复投递只计一次、非法事件可区分拒绝、
   64 线程并发提交同一 id 仅一次生效、多线程并发写入总数精确；
 - `tests/test_subscription.py`：断点续传不缺失不重复、
-  消费落后触发背压拒绝、边消费边确认永不阻塞、非法 ack 被拒绝。
+  消费落后触发背压拒绝、边消费边确认永不阻塞、非法 ack 被拒绝；
+- `tests/test_retention.py`：保留上限与 FIFO 淘汰、续传点过旧被显式拒绝
+  （且与背压可区分）、空闲订阅被淘汰追上后在 poll 时拒绝；
+- `tests/test_reclamation.py`：窗口 FINAL 后状态回收、长跑下存活窗口数有界、
+  `/stats` 各类计数与仪表；
+- `tests/test_http_sessions.py`：HTTP 会话式订阅的进度延续、
+  只有 ack 才算消费、慢消费者 409 背压与恢复、多客户端互不影响、
+  续传点过旧 410、未知会话 404、非法 ack 400。
+
+本地手动验证（服务启动后）：
+
+```bash
+uv run python main.py   # 记住输出中的端口号 PORT
+# 产生一批结果后，连续观察内存受控与计数变化：
+curl localhost:PORT/stats
+```
+
+## 兼容范围
+
+- 窗口触发 / 修正 / 终结的判定、重复投递与超期事件的结论完全不变；
+- 内存 API `subscribe(after_seq)` / `poll` / `ack` 签名不变，
+  仅在续传点过旧时新增 `ResumePointExpired` 显式拒绝（此前会静默缺数据）；
+- `GET /results` 无状态拉取保留，新客户端建议改用会话式端点。
 
 ## 代码结构
 
@@ -90,7 +162,9 @@ eventagg/
   watermark.py     # 水位线跟踪（单调不回退）
   window.py        # 滚动窗口分配与窗口聚合状态
   dedup.py         # 幂等去重存储（原子 check-and-mark，容量有界）
-  aggregator.py    # 核心引擎：校验→去重→水位线→窗口→发射
-  subscription.py  # 结果日志与订阅（断点续传、背压拒绝）
-main.py            # FastAPI HTTP 入口
+  stats.py         # 运行计数器（各类拒绝/忽略，线程安全）
+  aggregator.py    # 核心引擎：校验→去重→水位线→窗口→发射；FINAL 后回收状态
+  subscription.py  # 有界结果日志与订阅（断点续传、背压、续传点过旧拒绝）
+  sessions.py      # 会话注册表：每客户端独立游标，LRU 上限
+main.py            # FastAPI HTTP 入口（create_app 工厂 + 会话式订阅端点）
 ```

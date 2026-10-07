@@ -1,5 +1,6 @@
 """Event-time stream aggregator: windowing, watermark, idempotency, subscription."""
 
+from eventagg.aggregator import Aggregator, AggregatorConfig
 from eventagg.models import (
     Event,
     IngestResult,
@@ -8,18 +9,22 @@ from eventagg.models import (
     WindowResult,
     WindowState,
 )
-from eventagg.aggregator import Aggregator, AggregatorConfig
-from eventagg.subscription import Subscription, SubscriptionClosed
+from eventagg.subscription import (
+    ResumePointExpired,
+    Subscription,
+    SubscriptionClosed,
+)
 
 __all__ = [
+    "Aggregator",
+    "AggregatorConfig",
     "Event",
     "IngestResult",
     "IngestStatus",
     "RejectReason",
-    "WindowResult",
-    "WindowState",
-    "Aggregator",
-    "AggregatorConfig",
+    "ResumePointExpired",
     "Subscription",
     "SubscriptionClosed",
+    "WindowResult",
+    "WindowState",
 ]

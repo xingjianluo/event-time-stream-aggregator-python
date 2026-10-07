@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import threading
-import time
 from dataclasses import dataclass
 
 from eventagg.dedup import DedupStore
@@ -16,6 +15,7 @@ from eventagg.models import (
     WindowResult,
     WindowState,
 )
+from eventagg.stats import Counters
 from eventagg.subscription import ResultLog, Subscription
 from eventagg.watermark import WatermarkTracker
 from eventagg.window import WindowAgg, window_of
@@ -30,6 +30,7 @@ class AggregatorConfig:
     allowed_lateness: float = 30.0     # extra time a triggered window accepts corrections
     dedup_capacity: int = 100_000      # max remembered event ids
     log_capacity: int = 10_000         # max unacked results per subscription
+    retention_capacity: int = 10_000   # max results retained in the log
 
 
 class Aggregator:
@@ -42,6 +43,13 @@ class Aggregator:
       watermark >= window_end + allowed_lateness, then it is FINAL.
     - An event whose window is already FINAL is ignored as TOO_LATE.
     - An event id already applied is ignored as DUPLICATE (exactly-once).
+
+    Long-running resource bounds:
+    - The result log retains at most `retention_capacity` results; older
+      ones are evicted and resume points into them are refused explicitly.
+    - Once a window is FINAL its aggregation state is reclaimed, so the
+      number of live window states stays proportional to the lateness
+      horizon, not to uptime.
     """
 
     def __init__(self, config: AggregatorConfig | None = None) -> None:
@@ -50,7 +58,9 @@ class Aggregator:
         self._dedup = DedupStore(self.config.dedup_capacity)
         self._windows: dict[tuple[str, float], WindowAgg] = {}
         self._states: dict[tuple[str, float], WindowState] = {}
-        self._log = ResultLog()
+        self._counters = Counters()
+        self._log = ResultLog(self.config.retention_capacity,
+                              counters=self._counters)
         self._seq = 0
         self._lock = threading.Lock()
 
@@ -60,6 +70,7 @@ class Aggregator:
         """Validate, dedup, and fold one event into its window."""
         invalid = self._validate(event)
         if invalid is not None:
+            self._counters.incr("rejected_invalid")
             return invalid
 
         start, end = window_of(event.event_time, self.config.window_size)
@@ -69,6 +80,7 @@ class Aggregator:
             wm = self._wm.current
             # Lateness horizon: window already finalized -> too late.
             if wm >= end + self.config.allowed_lateness:
+                self._counters.incr("ignored_too_late")
                 return IngestResult(
                     IngestStatus.IGNORED,
                     RejectReason.TOO_LATE,
@@ -77,6 +89,7 @@ class Aggregator:
                 )
             # Idempotency: atomic check-and-mark under the same lock.
             if not self._dedup.check_and_mark(event.event_id):
+                self._counters.incr("ignored_duplicate")
                 return IngestResult(
                     IngestStatus.IGNORED,
                     RejectReason.DUPLICATE,
@@ -103,6 +116,7 @@ class Aggregator:
             wm = self._wm.observe(event.event_time)
             self._advance(wm)
 
+            self._counters.incr("accepted")
             return IngestResult(IngestStatus.ACCEPTED, RejectReason.NONE,
                                 f"applied to window [{start}, {end})")
 
@@ -111,9 +125,24 @@ class Aggregator:
         return self._wm.current
 
     def subscribe(self, after_seq: int = 0) -> Subscription:
-        """Open a subscription over emitted results, resuming after `after_seq`."""
+        """Open a subscription over emitted results, resuming after `after_seq`.
+
+        Raises ResumePointExpired if `after_seq` points at results already
+        evicted by retention: the client must do a full resync.
+        """
         return Subscription(self._log, after_seq=after_seq,
-                            capacity=self.config.log_capacity)
+                            capacity=self.config.log_capacity,
+                            counters=self._counters)
+
+    def stats(self) -> dict[str, int]:
+        """Runtime snapshot: live windows, retained results, decision counts."""
+        with self._lock:
+            open_windows = len(self._windows)
+        snap = self._counters.snapshot()
+        snap["open_windows"] = open_windows
+        snap["retained_results"] = len(self._log)
+        snap["evicted_results"] = self._log.evicted_upto
+        return snap
 
     # ------------------------------------------------------------- internal
 
@@ -134,7 +163,13 @@ class Aggregator:
         return None
 
     def _advance(self, wm: float) -> None:
-        """Fire TRIGGERED and FINAL emissions for windows crossed by `wm`."""
+        """Fire TRIGGERED and FINAL emissions for windows crossed by `wm`.
+
+        Windows that reach FINAL are reclaimed: their aggregation state is
+        dropped so memory stays bounded over long uptimes. The lateness
+        horizon check in `ingest` is watermark-based, so reclaiming a FINAL
+        window does not change any subsequent decision.
+        """
         for wkey in sorted(self._windows):
             agg = self._windows[wkey]
             state = self._states[wkey]
@@ -149,6 +184,11 @@ class Aggregator:
                            f"watermark {wm} >= window end {agg.end} + "
                            f"allowed_lateness {self.config.allowed_lateness}; "
                            f"window closed permanently")
+        # Reclaim state of permanently closed windows.
+        closed = [k for k, s in self._states.items() if s is WindowState.FINAL]
+        for wkey in closed:
+            del self._states[wkey]
+            del self._windows[wkey]
 
     def _emit(self, agg: WindowAgg, state: WindowState, reason: str) -> None:
         self._seq += 1
