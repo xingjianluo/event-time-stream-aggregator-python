@@ -9,7 +9,13 @@ from eventagg.models import (
     WindowState,
 )
 from eventagg.aggregator import Aggregator, AggregatorConfig
-from eventagg.subscription import Subscription, SubscriptionClosed
+from eventagg.stats import Stats
+from eventagg.subscription import (
+    ResumeTooOld,
+    Subscription,
+    SubscriptionClosed,
+    SubscriptionError,
+)
 
 __all__ = [
     "Event",
@@ -20,6 +26,9 @@ __all__ = [
     "WindowState",
     "Aggregator",
     "AggregatorConfig",
+    "Stats",
     "Subscription",
+    "SubscriptionError",
     "SubscriptionClosed",
+    "ResumeTooOld",
 ]

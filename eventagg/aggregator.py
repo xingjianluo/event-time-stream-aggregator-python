@@ -16,6 +16,7 @@ from eventagg.models import (
     WindowResult,
     WindowState,
 )
+from eventagg.stats import Stats
 from eventagg.subscription import ResultLog, Subscription
 from eventagg.watermark import WatermarkTracker
 from eventagg.window import WindowAgg, window_of
@@ -30,6 +31,7 @@ class AggregatorConfig:
     allowed_lateness: float = 30.0     # extra time a triggered window accepts corrections
     dedup_capacity: int = 100_000      # max remembered event ids
     log_capacity: int = 10_000         # max unacked results per subscription
+    result_retention: int = 10_000     # max results retained for replay/resume
 
 
 class Aggregator:
@@ -50,7 +52,9 @@ class Aggregator:
         self._dedup = DedupStore(self.config.dedup_capacity)
         self._windows: dict[tuple[str, float], WindowAgg] = {}
         self._states: dict[tuple[str, float], WindowState] = {}
-        self._log = ResultLog()
+        self._stats = Stats()
+        self._log = ResultLog(retention=self.config.result_retention,
+                              stats=self._stats)
         self._seq = 0
         self._lock = threading.Lock()
 
@@ -60,6 +64,7 @@ class Aggregator:
         """Validate, dedup, and fold one event into its window."""
         invalid = self._validate(event)
         if invalid is not None:
+            self._stats.incr("invalid")
             return invalid
 
         start, end = window_of(event.event_time, self.config.window_size)
@@ -69,6 +74,7 @@ class Aggregator:
             wm = self._wm.current
             # Lateness horizon: window already finalized -> too late.
             if wm >= end + self.config.allowed_lateness:
+                self._stats.incr("too_late")
                 return IngestResult(
                     IngestStatus.IGNORED,
                     RejectReason.TOO_LATE,
@@ -77,6 +83,7 @@ class Aggregator:
                 )
             # Idempotency: atomic check-and-mark under the same lock.
             if not self._dedup.check_and_mark(event.event_id):
+                self._stats.incr("duplicate")
                 return IngestResult(
                     IngestStatus.IGNORED,
                     RejectReason.DUPLICATE,
@@ -103,6 +110,7 @@ class Aggregator:
             wm = self._wm.observe(event.event_time)
             self._advance(wm)
 
+            self._stats.incr("accepted")
             return IngestResult(IngestStatus.ACCEPTED, RejectReason.NONE,
                                 f"applied to window [{start}, {end})")
 
@@ -111,9 +119,32 @@ class Aggregator:
         return self._wm.current
 
     def subscribe(self, after_seq: int = 0) -> Subscription:
-        """Open a subscription over emitted results, resuming after `after_seq`."""
+        """Open a subscription over emitted results, resuming after `after_seq`.
+
+        Raises ResumeTooOld if `after_seq` has already been evicted from
+        the bounded result log; the caller must then re-sync from scratch.
+        """
         return Subscription(self._log, after_seq=after_seq,
-                            capacity=self.config.log_capacity)
+                            capacity=self.config.log_capacity,
+                            stats=self._stats)
+
+    def stats(self) -> dict:
+        """Runtime snapshot: live state sizes plus monotone counters.
+
+        Includes the number of windows still accumulating, results still
+        retained for replay, and per-kind accept/ignore/refuse counts so
+        operators can verify memory is bounded and see why events or
+        consumers were refused.
+        """
+        with self._lock:
+            open_windows = len(self._windows)
+        snap = self._stats.snapshot()
+        return {
+            "open_windows": open_windows,
+            "retained_results": len(self._log),
+            "watermark": self._wm.current,
+            **snap,
+        }
 
     # ------------------------------------------------------------- internal
 
@@ -134,7 +165,13 @@ class Aggregator:
         return None
 
     def _advance(self, wm: float) -> None:
-        """Fire TRIGGERED and FINAL emissions for windows crossed by `wm`."""
+        """Fire TRIGGERED and FINAL emissions for windows crossed by `wm`.
+
+        Once a window is FINAL its per-window state is reclaimed: the
+        watermark never recedes, so any later event for that window is
+        rejected as TOO_LATE before touching window state, and keeping
+        the aggregate around would only leak memory.
+        """
         for wkey in sorted(self._windows):
             agg = self._windows[wkey]
             state = self._states[wkey]
@@ -149,6 +186,13 @@ class Aggregator:
                            f"watermark {wm} >= window end {agg.end} + "
                            f"allowed_lateness {self.config.allowed_lateness}; "
                            f"window closed permanently")
+        # Reclaim state of permanently closed windows.
+        closed = [k for k, s in self._states.items() if s is WindowState.FINAL]
+        for k in closed:
+            del self._windows[k]
+            del self._states[k]
+        if closed:
+            self._stats.incr("windows_reclaimed", len(closed))
 
     def _emit(self, agg: WindowAgg, state: WindowState, reason: str) -> None:
         self._seq += 1
